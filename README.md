@@ -9,7 +9,8 @@ Built for external network penetration tests where Nessus dumps hundreds of brow
 1. **Parses input** -- reads `.nessus` XML, Nessus CSV exports, or a plain text file of URLs
 2. **Crawls recursively** -- follows directory listing links (Apache, Nginx, IIS, etc.) down to configurable depth
 3. **Downloads and scans** -- pulls files under a size limit, runs 30+ regex patterns for secrets, flags sensitive filenames
-4. **Reports findings** -- outputs a text report (sorted by severity, grouped by host), a JSON file for scripting, and a full file inventory CSV
+4. **TruffleHog (optional)** -- runs trufflehog's entropy analysis and verified credential checks over downloaded files
+5. **Reports findings** -- outputs a text report (sorted by severity, grouped by host), a JSON file for scripting, and a full file inventory CSV
 
 All requests are GET-only. Nothing destructive.
 
@@ -19,6 +20,8 @@ All requests are GET-only. Nothing destructive.
 - `requests` (`pip3 install requests`)
 
 Pre-installed on Kali. No other dependencies.
+
+**Optional:** [trufflehog](https://github.com/trufflesecurity/trufflehog) for entropy analysis and verified credential detection (used with `--trufflehog`)
 
 ## Usage
 
@@ -40,6 +43,9 @@ python3 dir_loot.py -i scan.nessus -o ./loot --proxy http://127.0.0.1:8080
 
 # Just inventory files without downloading
 python3 dir_loot.py -i scan.nessus -o ./loot --crawl-only
+
+# Add trufflehog entropy/verified credential scan on top of regex
+python3 dir_loot.py -i scan.nessus -o ./loot --trufflehog
 ```
 
 ## Options
@@ -57,6 +63,7 @@ python3 dir_loot.py -i scan.nessus -o ./loot --crawl-only
 | `--cookie` | | Cookie as `name=value` (repeatable) |
 | `--auth` | | Basic auth as `user:pass` |
 | `--crawl-only` | | Crawl and inventory only, skip downloads |
+| `--trufflehog` | | Run trufflehog over downloaded files (requires `trufflehog` in PATH) |
 
 ## Input Formats
 
@@ -133,6 +140,18 @@ Array of finding objects for further processing:
 - Password/secret/token assignments in config files
 - Environment variable secrets (DB_PASSWORD, SECRET_KEY, etc.)
 - `.htpasswd` and shadow file entries
+
+### TruffleHog (with `--trufflehog`)
+
+When enabled, trufflehog runs as a second pass over the downloaded files after the built-in regex scan. It adds:
+
+- **Entropy analysis** -- catches high-entropy strings that don't match a known format but are likely secrets
+- **Verified credentials** -- attempts to validate discovered credentials against live APIs (AWS, GitHub, Slack, etc.) and marks them as verified/unverified
+- **800+ detectors** -- broader coverage than the built-in patterns, including less common services
+
+Results are deduplicated against the regex findings so you don't get double-reported. Verified findings from trufflehog are marked CRITICAL; unverified are HIGH. Both sources appear together in the final report.
+
+The built-in regex scan still runs first and works without any extra installs. TruffleHog is additive.
 
 ### Interesting Files (flagged by name or extension)
 

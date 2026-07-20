@@ -22,7 +22,9 @@ import csv
 import json
 import os
 import re
+import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -582,6 +584,90 @@ def download_and_scan_all(file_urls, output_dir, max_size, timeout, threads):
     return all_findings
 
 
+# ── TruffleHog Integration ───────────────────────────────────────────────────
+
+def _find_trufflehog():
+    return shutil.which("trufflehog")
+
+
+def run_trufflehog(output_dir):
+    binary = _find_trufflehog()
+    if not binary:
+        print("[!] trufflehog not found in PATH. Install: https://github.com/trufflesecurity/trufflehog")
+        print("[!] Skipping trufflehog scan.")
+        return []
+
+    downloads_dir = os.path.join(output_dir, "downloads")
+    if not os.path.isdir(downloads_dir):
+        return []
+
+    print(f"[*] Running trufflehog against {downloads_dir} ...")
+    try:
+        result = subprocess.run(
+            [binary, "filesystem", "--json", "--no-update", downloads_dir],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        print("[!] trufflehog timed out after 10 minutes.")
+        return []
+    except Exception as e:
+        print(f"[!] trufflehog failed: {e}")
+        return []
+
+    findings = []
+    for line in result.stdout.strip().splitlines():
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        detector = obj.get("DetectorName") or obj.get("detectorName") or "Unknown"
+        raw = obj.get("Raw") or obj.get("raw") or ""
+        verified = obj.get("Verified", obj.get("verified", False))
+
+        source_meta = obj.get("SourceMetadata", obj.get("sourceMetadata", {}))
+        data = source_meta.get("Data", source_meta.get("data", {}))
+        filesystem = data.get("Filesystem", data.get("filesystem", {}))
+        filepath = filesystem.get("file", "")
+
+        file_url = _local_path_to_url(filepath, output_dir)
+
+        severity = "CRITICAL" if verified else "HIGH"
+
+        findings.append({
+            "type": "secret",
+            "pattern_name": f"trufflehog: {detector}",
+            "severity": severity,
+            "url": file_url,
+            "match": raw[:200],
+            "context": f"Verified: {verified}",
+            "line": filesystem.get("line", 0),
+            "local_path": filepath,
+            "verified": verified,
+        })
+
+    verified_count = sum(1 for f in findings if f.get("verified"))
+    print(f"[+] trufflehog found {len(findings)} results ({verified_count} verified)")
+    return findings
+
+
+def _local_path_to_url(filepath, output_dir):
+    """Best-effort map of a downloaded file path back to its source URL."""
+    downloads_prefix = os.path.join(output_dir, "downloads") + os.sep
+    if filepath.startswith(downloads_prefix):
+        rel = filepath[len(downloads_prefix):]
+        parts = rel.split(os.sep, 1)
+        if len(parts) == 2:
+            host_part, path_part = parts
+            host = host_part.replace("_", ":", 1) if "_" in host_part else host_part
+            return f"http://{host}/{path_part}"
+    return filepath
+
+
 # ── Reporting ────────────────────────────────────────────────────────────────
 
 SEVERITY_RANK = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
@@ -716,6 +802,8 @@ def parse_args():
     p.add_argument("--auth", help="Basic auth as user:pass")
     p.add_argument("--crawl-only", action="store_true",
                    help="Crawl and inventory only; skip downloads and scanning")
+    p.add_argument("--trufflehog", action="store_true",
+                   help="Run trufflehog on downloaded files (requires trufflehog in PATH)")
     return p.parse_args()
 
 
@@ -784,6 +872,23 @@ def main():
         file_urls, args.output, args.max_size, args.timeout, args.threads,
     )
     print(f"[+] Download/scan complete in {time.time() - t0:.1f}s")
+
+    # Phase 2b: TruffleHog (optional)
+    if args.trufflehog:
+        print(f"\n[*] Phase 2b: TruffleHog deep scan (entropy + verified credentials)")
+        th_findings = run_trufflehog(args.output)
+        if th_findings:
+            existing_matches = {
+                (f["url"], f["match"]) for f in findings if f["type"] == "secret"
+            }
+            deduped = 0
+            for tf in th_findings:
+                if (tf["url"], tf["match"]) not in existing_matches:
+                    findings.append(tf)
+                else:
+                    deduped += 1
+            if deduped:
+                print(f"[+] Deduplicated {deduped} findings already caught by regex scan")
 
     # Phase 3: Report
     print("\n[*] Phase 3: Generating reports...")
